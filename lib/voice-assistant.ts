@@ -234,9 +234,9 @@ const NO_PATTERNS_EN = [
 ];
 
 // How long to wait after the latest speech event before committing the
-// captured command. Keep this generous — people often pause mid-thought
-// while phrasing a request.
-const SILENCE_TIMEOUT_MS = 2800;
+// captured command. 1.8s felt better in practice: responsive enough that
+// mobile users do not think the assistant is stuck after they finish talking.
+const SILENCE_TIMEOUT_MS = 1800;
 const LISTENING_MAX_MS = 14000;
 const CONFIRM_MAX_MS = 18000;
 const RECOGNITION_WATCHDOG_MS = 1200;
@@ -1334,6 +1334,11 @@ export function useVoiceAssistant({
         pending.resolved,
         meRef.current,
       );
+      // Make newly-created/edited tasks available to the very next voice
+      // command immediately, without waiting for React to re-render the
+      // hook with the saved state. This fixes "create test" → "assign test"
+      // when the second command follows right after the first.
+      stateRef.current = next;
       await onApplyRef.current(next);
       await speak(prompts.applied, bcp47);
     } catch (error) {
@@ -1442,7 +1447,7 @@ export function useVoiceAssistant({
     [armListeningMaxTimer, clearTimers, handleFinalCommand, setStatusSafe],
   );
 
-  const startBackgroundRecognition = useCallback(() => {
+  const startBackgroundRecognition = useCallback((allowPermissionPrompt = false) => {
     void (async () => {
       const Ctor = ctorRef.current;
       if (!Ctor || !activeRef.current) return;
@@ -1457,6 +1462,14 @@ export function useVoiceAssistant({
         setErrorMessage(langConfig(languageRef.current).prompts.permissionDenied);
         setStatusSafe("needs-permission");
         stopRecognition();
+        return;
+      }
+      if (permission === "prompt" && !allowPermissionPrompt) {
+        // Do not trigger the browser's permission prompt from an automatic
+        // startup/watchdog path. Permission prompts should only appear from a
+        // user gesture (tap on the orb/login flow), which prevents the site
+        // from asking over and over on every automatic re-arm.
+        setStatusSafe("needs-permission");
         return;
       }
 
@@ -1691,7 +1704,7 @@ export function useVoiceAssistant({
       // Try again to start (gesture-driven re-permission).
       setErrorMessage(null);
       setStatusSafe("idle");
-      startBackgroundRecognition();
+      startBackgroundRecognition(true);
       return;
     }
     if (statusRef.current !== "idle") return;
@@ -1699,6 +1712,7 @@ export function useVoiceAssistant({
     provisionalRef.current = "";
     setTranscript("");
     setStatusSafe("listening");
+    startBackgroundRecognition(true);
     chime("wake");
     armListeningMaxTimer();
   }, [

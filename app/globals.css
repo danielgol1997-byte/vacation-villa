@@ -1304,7 +1304,9 @@ p {
    * off the top of the screen on small phones. The panel itself scrolls
    * internally if needed. */
   max-height: calc(100vh - 40px);
-  z-index: 60;
+  /* Below website modals (50/60) so a permission/voice panel cannot block
+   * task dialogs, but still above the normal page content. */
+  z-index: 45;
   display: flex;
   flex-direction: column;
   align-items: stretch;

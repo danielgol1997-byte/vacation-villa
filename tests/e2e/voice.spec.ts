@@ -3,6 +3,7 @@ import { freshLogin, resetState, TEST_SEED } from "./helpers";
 
 type AssistMock = {
   match: RegExp;
+  assertBody?: (body: { command?: string; state?: typeof TEST_SEED }) => void;
   response: {
     speech: string;
     resolved: unknown[];
@@ -82,6 +83,13 @@ async function installVoiceMocks(page: Page) {
       webkitSpeechRecognition: MockRecognition,
       SpeechSynthesisUtterance: MockUtterance,
       __villaMockRecognition: MockRecognition,
+    });
+
+    Object.defineProperty(navigator, "permissions", {
+      configurable: true,
+      value: {
+        query: async () => ({ state: "granted" }),
+      },
     });
 
     Object.defineProperty(window, "speechSynthesis", {
@@ -169,6 +177,7 @@ function mockAssist(page: Page, mocks: AssistMock[]) {
       if (!mock) {
         throw new Error(`Unexpected assist command: ${command}`);
       }
+      mock.assertBody?.(body as { command?: string; state?: typeof TEST_SEED });
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -212,6 +221,18 @@ test.describe("voice assistant state machine", () => {
           ],
         },
       },
+      {
+        match: /assign towels/i,
+        assertBody: (body) => {
+          if (!body.state?.tasks.some((task) => task.title === "להביא מגבות")) {
+            throw new Error("Newly-created task was missing from next assist request state");
+          }
+        },
+        response: {
+          speech: "I found the towels task.",
+          resolved: [{ type: "answer", text: "I found the towels task." }],
+        },
+      },
     ]);
 
     await latestRecognitionSpeak(page, "hey villa");
@@ -228,6 +249,10 @@ test.describe("voice assistant state machine", () => {
     });
     await confirmByVoice(page);
     await expect(page.getByRole("heading", { name: "להביא מגבות" })).toBeVisible();
+
+    await wake(page);
+    await latestRecognitionSpeak(page, "assign towels to michal");
+    await expect(page.getByText("I found the towels task.")).toBeVisible();
   });
 
   test("can edit task day and assign another person by voice", async ({
