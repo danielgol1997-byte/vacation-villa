@@ -400,13 +400,16 @@ export default function Home() {
     [state, saveState],
   );
 
+  // Default to English for any user who hasn't explicitly picked a
+  // language. Once they tap the language toggle (or say "switch to
+  // Hebrew") it gets persisted into memberPrefs and overrides this.
   const assistantLanguage: AssistantLanguage =
-    state && me ? state.memberPrefs?.[me]?.language ?? "he" : "he";
+    state && me ? state.memberPrefs?.[me]?.language ?? "en" : "en";
 
   const setAssistantLanguage = useCallback(
     (lang: AssistantLanguage) => {
       if (!state || !me) return;
-      const current = state.memberPrefs?.[me]?.language ?? "he";
+      const current = state.memberPrefs?.[me]?.language ?? "en";
       if (current === lang) return;
       void saveState({
         ...state,
