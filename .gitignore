@@ -1,0 +1,15 @@
+node_modules
+.next
+*.tsbuildinfo
+.env*.local
+.env
+.DS_Store
+.vercel
+
+# Local dev state file (api/state writes here when there's no Blob token).
+.data/
+
+# Playwright artifacts
+.playwright-data/
+playwright-report/
+test-results/
