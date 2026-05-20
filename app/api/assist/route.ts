@@ -277,11 +277,25 @@ export type ResolvedAction =
 
 function summarizeTasks(tasks: VacationTask[]): string {
   return tasks
-    .map(
-      (task) =>
-        `${task.id} | ${task.day} | ${task.title} | חתום: ${task.assignees.join(", ") || "אף אחד"} (${task.assignees.length}/${task.needed})`,
-    )
+    .map((task) => {
+      const aliases = taskSearchTerms(task.title).filter((term) => term !== task.title);
+      const aliasText = aliases.length ? ` | aliases: ${aliases.join(", ")}` : "";
+      return `${task.id} | ${task.day} | ${task.title}${aliasText} | חתום: ${task.assignees.join(", ") || "אף אחד"} (${task.assignees.length}/${task.needed})`;
+    })
     .join("\n");
+}
+
+async function loadLatestState(request: Request, fallback: VacationState) {
+  try {
+    const response = await fetch(new URL("/api/state", request.url), {
+      cache: "no-store",
+    });
+    if (!response.ok) return fallback;
+    const data = (await response.json()) as { state?: VacationState };
+    return data.state ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function summarizePlan(items: PlanItem[]): string {
@@ -293,13 +307,34 @@ function summarizePlan(items: PlanItem[]): string {
     .join("\n");
 }
 
+function taskSearchTerms(title: string): string[] {
+  const terms = new Set([title]);
+  const lower = title.trim().toLocaleLowerCase();
+
+  // Persisted data is mostly Hebrew, but users may refer back to a just-created
+  // "test" task by its English label. Treat common Hebrew/English test words
+  // as aliases so "create task test" -> "assign test to X" still resolves.
+  if (lower === "בדיקה" || lower === "טסט") terms.add("test");
+  if (lower === "test") {
+    terms.add("בדיקה");
+    terms.add("טסט");
+  }
+
+  return Array.from(terms);
+}
+
 function resolveTask(query: string, tasks: VacationTask[]): VacationTask | null {
   if (!tasks.length) return null;
-  const titles = tasks.map((t) => t.title);
-  const match = findClosestMember(query, titles);
+  const searchable = tasks.flatMap((task) =>
+    taskSearchTerms(task.title).map((term) => ({ task, term })),
+  );
+  const match = findClosestMember(
+    query,
+    searchable.map((item) => item.term),
+  );
   if (!match) return null;
   if (match.score < 0.45) return null;
-  return tasks.find((t) => t.title === match.name) ?? null;
+  return searchable.find((item) => item.term === match.name)?.task ?? null;
 }
 
 function resolvePlan(query: string, items: PlanItem[]): PlanItem | null {
@@ -751,6 +786,7 @@ Exception: if the user asks a read-only information question ("what am I signed 
 # THE GOLDEN RULE: DATA STAYS HEBREW
 Every value you write into a data field — \`taskQuery\`, \`title\`, \`items\`, \`notes\`, \`itemQuery\`, \`planQuery\`, \`location\`, \`newTitle\` — MUST be in natural Hebrew. \`memberQuery\` may stay in the user's language (the server fuzzy-matches it against the members list).
 Even when the user speaks English, you translate their words to concise Hebrew before placing them in any of these fields. The existing data is all Hebrew and matching depends on it.
+Exception: if the user explicitly names a task with a literal label in quotes or wording like "called X" / "named X" and X is not meaningful vacation content, preserve that literal label rather than translating it. For example, "create a task called test" may use title:"test"; if an existing task is already titled "בדיקה", use taskQuery:"בדיקה" when the user later says "test".
 
 Examples of correct translation:
 - User (en): "Add me to the shopping list" → type:"signup", taskQuery:"רשימת קניות" (matches an existing Hebrew title).
@@ -909,11 +945,12 @@ export async function POST(request: Request) {
   }
 
   try {
+    const latestState = await loadLatestState(request, state);
     // Hand the model the full known-name pool, not just logged-in members.
     // The fuzzy matcher on the server uses the same expanded pool, so this
     // keeps the two ends consistent: anyone the AI sees in this list IS a
     // valid `memberQuery` value, and the resolver will find them.
-    const knownMembers = knownMembersOf(state, me);
+    const knownMembers = knownMembersOf(latestState, me);
 
     const userContext = [
       `Current user: ${me || "unknown"} (preferred language: ${language === "en" ? "English" : "Hebrew"}).`,
@@ -921,10 +958,10 @@ export async function POST(request: Request) {
       `Family members (canonical names — use these when picking memberQuery): ${knownMembers.join(", ") || "(none yet)"}`,
       "",
       "Existing tasks (id | day | Hebrew title | signed-up):",
-      summarizeTasks(state.tasks),
+      summarizeTasks(latestState.tasks),
       "",
       "Existing plan items (id | day | title):",
-      summarizePlan(state.planItems),
+      summarizePlan(latestState.planItems),
       "",
       `User said: "${command}"`,
     ].join("\n");
@@ -939,7 +976,7 @@ export async function POST(request: Request) {
 
     const proposal = result.object;
     const resolved = proposal.actions.map((action) =>
-      resolveAction(action, state, language, me),
+      resolveAction(action, latestState, language, me),
     );
 
     const hasAmbiguous = resolved.some((r) => r.type === "ambiguous");
