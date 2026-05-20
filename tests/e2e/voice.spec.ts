@@ -146,6 +146,13 @@ async function confirmByVoice(page: Page) {
 async function setupVoicePage(page: Page, baseURL: string) {
   await freshLogin(page);
   await installVoiceMocks(page);
+  await page.route("**/api/speech", async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "tts-disabled-in-tests" }),
+    });
+  });
   await resetState(page.request, baseURL);
   await page.goto("/");
   await page.getByRole("button", { name: "+ הוספת שם חדש" }).click();

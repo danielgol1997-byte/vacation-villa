@@ -32,7 +32,7 @@ import type {
   VacationState,
   VacationTask,
 } from "@/lib/types";
-import { useVoiceAssistant } from "@/lib/voice-assistant";
+import { unlockVoiceAudio, useVoiceAssistant } from "@/lib/voice-assistant";
 import { VoiceOrb } from "./voice-orb";
 
 type ApiResponse = {
@@ -298,6 +298,7 @@ export default function Home() {
     (name: string, ensureMember = true) => {
       const trimmed = name.trim();
       if (!trimmed) return;
+      unlockVoiceAudio();
       window.localStorage.setItem(STORAGE_KEY, trimmed);
       setMe(trimmed);
       if (ensureMember && state && !state.members.includes(trimmed)) {

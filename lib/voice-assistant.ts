@@ -240,6 +240,7 @@ const SILENCE_TIMEOUT_MS = 2800;
 const LISTENING_MAX_MS = 14000;
 const CONFIRM_MAX_MS = 18000;
 const RECOGNITION_WATCHDOG_MS = 1200;
+const MIC_PERMISSION_KEY = "villa-mic-permission-granted";
 
 const PROMPTS = {
   he: {
@@ -360,6 +361,8 @@ const VOICE_PREFS: Record<"he" | "en", { exact: string[]; contains: string[] }> 
 
 let cachedVoicesByLang: Partial<Record<"he" | "en", SpeechSynthesisVoice | null>> =
   {};
+let sharedTtsAudio: HTMLAudioElement | null = null;
+let audioUnlocked = false;
 
 function pickVoice(langKey: "he" | "en"): SpeechSynthesisVoice | null {
   if (cachedVoicesByLang[langKey] !== undefined)
@@ -419,7 +422,115 @@ if (typeof window !== "undefined" && hasSpeechSynthesis()) {
   }
 }
 
-function speak(text: string, lang: string): Promise<void> {
+function getSharedTtsAudio(): HTMLAudioElement | null {
+  if (typeof window === "undefined") return null;
+  if (!sharedTtsAudio) {
+    sharedTtsAudio = new Audio();
+    sharedTtsAudio.preload = "auto";
+    sharedTtsAudio.setAttribute("playsinline", "true");
+  }
+  return sharedTtsAudio;
+}
+
+export function unlockVoiceAudio(): void {
+  const ctx = getAudioContext();
+  if (ctx?.state === "suspended") {
+    void ctx.resume().catch(() => {});
+  }
+
+  const audio = getSharedTtsAudio();
+  if (!audio || audioUnlocked) return;
+
+  // Mobile Safari/Chrome only allow later programmatic playback if a media
+  // element has been touched from a real user gesture. Login is a gesture,
+  // so prime the exact audio element we will reuse for TTS responses.
+  const previousMuted = audio.muted;
+  audio.muted = true;
+  audio.src =
+    "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+  void audio
+    .play()
+    .then(() => {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.muted = previousMuted;
+      audioUnlocked = true;
+    })
+    .catch(() => {
+      audio.muted = previousMuted;
+    });
+
+  if (hasSpeechSynthesis()) {
+    try {
+      // Also prime speechSynthesis as a fallback for browsers that still
+      // block HTMLAudio later. This utterance is silent/near-empty.
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(" ");
+      utterance.volume = 0;
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function speakWithOpenAiAudio(
+  text: string,
+  lang: string,
+): Promise<boolean> {
+  const audio = getSharedTtsAudio();
+  if (!audio || !text) return false;
+
+  try {
+    const response = await fetch("/api/speech", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        language: lang.toLowerCase().startsWith("he") ? "he" : "en",
+      }),
+    });
+    if (!response.ok) return false;
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        audio.onended = null;
+        audio.onerror = null;
+        URL.revokeObjectURL(url);
+        resolve();
+      };
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        audio.onended = null;
+        audio.onerror = null;
+        URL.revokeObjectURL(url);
+        reject(new Error("Audio playback failed"));
+      };
+      const timeout = window.setTimeout(finish, Math.min(12000, Math.max(2500, text.length * 120)));
+
+      audio.pause();
+      audio.currentTime = 0;
+      audio.muted = false;
+      audio.onended = finish;
+      audio.onerror = fail;
+      audio.src = url;
+      audio.play().catch(fail);
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function speakWithBrowserVoice(text: string, lang: string): Promise<void> {
   return new Promise((resolve) => {
     if (!hasSpeechSynthesis() || !text) {
       resolve();
@@ -459,6 +570,15 @@ function speak(text: string, lang: string): Promise<void> {
       resolve();
     }
   });
+}
+
+async function speak(text: string, lang: string): Promise<void> {
+  if (!text) return;
+  // Prefer high-quality server-generated TTS. If mobile autoplay policy,
+  // OpenAI, or the network says no, fall back to browser speechSynthesis so
+  // the assistant still responds.
+  const played = await speakWithOpenAiAudio(text, lang);
+  if (!played) await speakWithBrowserVoice(text, lang);
 }
 
 // Singleton AudioContext — creating and tearing one down per chime was
@@ -559,6 +679,39 @@ function findWakeIndex(
     }
   }
   return null;
+}
+
+function rememberMicPermissionGranted(): void {
+  try {
+    window.localStorage.setItem(MIC_PERMISSION_KEY, "1");
+  } catch {
+    // Private browsing / storage-disabled environments are fine. The
+    // browser-level permission grant still belongs to this origin.
+  }
+}
+
+function clearRememberedMicPermission(): void {
+  try {
+    window.localStorage.removeItem(MIC_PERMISSION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+async function getMicrophonePermissionState(): Promise<
+  PermissionState | "unsupported"
+> {
+  if (typeof navigator === "undefined" || !("permissions" in navigator)) {
+    return "unsupported";
+  }
+  try {
+    const status = await navigator.permissions.query({
+      name: "microphone" as PermissionName,
+    });
+    return status.state;
+  } catch {
+    return "unsupported";
+  }
 }
 
 function summarizeAction(
@@ -1306,18 +1459,38 @@ export function useVoiceAssistant({
   );
 
   const startBackgroundRecognition = useCallback(() => {
-    const Ctor = ctorRef.current;
-    if (!Ctor) return;
-    stopRecognition();
-    const lang = languageRef.current;
-    const cfg = langConfig(lang);
-    const rec = new Ctor();
+    void (async () => {
+      const Ctor = ctorRef.current;
+      if (!Ctor || !activeRef.current) return;
+
+      // Permission itself is controlled by the browser and persisted per
+      // HTTPS origin. This preflight keeps us from hammering start() when the
+      // user has explicitly denied access, while still letting a prior grant
+      // start silently on future visits/devices that support persistent grants.
+      const permission = await getMicrophonePermissionState();
+      if (permission === "denied") {
+        clearRememberedMicPermission();
+        setErrorMessage(langConfig(languageRef.current).prompts.permissionDenied);
+        setStatusSafe("needs-permission");
+        stopRecognition();
+        return;
+      }
+
+      stopRecognition();
+      const lang = languageRef.current;
+      const cfg = langConfig(lang);
+      const rec = new Ctor();
     rec.lang = cfg.bcp47;
     rec.continuous = true;
     rec.interimResults = true;
     rec.maxAlternatives = 1;
 
+    rec.onaudiostart = () => {
+      rememberMicPermissionGranted();
+    };
+
     rec.onresult = (event) => {
+      rememberMicPermissionGranted();
       let finalText = "";
       let interimText = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -1396,6 +1569,7 @@ export function useVoiceAssistant({
 
     rec.onerror = (event) => {
       if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        clearRememberedMicPermission();
         setErrorMessage(cfg.prompts.permissionDenied);
         setStatusSafe("needs-permission");
         stopRecognition();
@@ -1457,6 +1631,7 @@ export function useVoiceAssistant({
     } catch {
       // Already started; ignore.
     }
+    })();
   }, [
     applyProposal,
     armSilenceTimer,
