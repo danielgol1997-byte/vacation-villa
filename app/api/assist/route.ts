@@ -369,6 +369,38 @@ function knownMembersOf(state: VacationState, me: string): string[] {
   return out;
 }
 
+const MEMBER_ALIASES: Record<string, string[]> = {
+  "דניאל": ["daniel"],
+  "איתמר": ["itamar", "ittamar"],
+  "מיכל": ["michal"],
+  "מיכאל": ["michael"],
+  "הדסה": ["hadassah", "hadasa"],
+  "מורדי": ["mordi", "mordy", "mordechai"],
+  "מרלי": ["marli", "marly", "marley"],
+  "תהילה": ["tehila", "tehilla"],
+  "שירה": ["shira"],
+  "נחמה": ["nechama"],
+  "אמא": ["ima", "mom", "mother"],
+};
+
+function resolveMember(query: string, knownMembers: string[]) {
+  const match = findClosestMember(query, knownMembers);
+  if (match && match.score >= 0.55) return match.name;
+
+  const normalized = query.toLocaleLowerCase();
+  for (const member of knownMembers) {
+    const aliases = MEMBER_ALIASES[member] ?? [];
+    if (
+      normalized.includes(member.toLocaleLowerCase()) ||
+      aliases.some((alias) => normalized.includes(alias))
+    ) {
+      return member;
+    }
+  }
+
+  return null;
+}
+
 function resolveChecklistItem(
   query: string,
   items: ChecklistItem[],
@@ -609,8 +641,8 @@ function resolveAction(
       // logged-in users. Otherwise pre-existing seed assignees (Hadassah,
       // Mordechai, etc.) can never be picked because they're not in
       // `state.members` until they personally log in.
-      const match = findClosestMember(action.memberQuery, knownMembers);
-      if (!match || match.score < 0.55)
+      const member = resolveMember(action.memberQuery, knownMembers);
+      if (!member)
         return ambiguousReason(
           language,
           `לא מצאתי בן משפחה שמתאים ל-"${action.memberQuery}".`,
@@ -620,7 +652,7 @@ function resolveAction(
         type: "addAssignee",
         taskId: task.id,
         taskTitle: task.title,
-        member: match.name,
+        member,
       };
     }
     case "removeAssignee": {
@@ -637,12 +669,9 @@ function resolveAction(
         return ambiguousReason(language, "חסר שם של חבר משפחה.", "Missing a family member name.");
       // Prefer matching against the task's current assignees first — that's
       // the most natural interpretation of "remove X from this task".
-      const fromAssignees = findClosestMember(action.memberQuery, task.assignees);
-      const match =
-        fromAssignees && fromAssignees.score >= 0.55
-          ? fromAssignees
-          : findClosestMember(action.memberQuery, knownMembers);
-      if (!match || match.score < 0.55)
+      const fromAssignees = resolveMember(action.memberQuery, task.assignees);
+      const member = fromAssignees ?? resolveMember(action.memberQuery, knownMembers);
+      if (!member)
         return ambiguousReason(
           language,
           `לא מצאתי בן משפחה שמתאים ל-"${action.memberQuery}".`,
@@ -652,7 +681,7 @@ function resolveAction(
         type: "removeAssignee",
         taskId: task.id,
         taskTitle: task.title,
-        member: match.name,
+        member,
       };
     }
     case "editTaskTitle": {
@@ -774,6 +803,7 @@ function resolveActions(
   state: VacationState,
   language: AssistantLanguage,
   me: string,
+  command: string,
 ): ResolvedAction[] {
   const resolved: ResolvedAction[] = [];
   const virtualTasks: VacationTask[] = [...state.tasks];
@@ -790,8 +820,8 @@ function resolveActions(
           );
           continue;
         }
-        const member = findClosestMember(action.memberQuery, knownMembers);
-        if (!member || member.score < 0.55) {
+        const member = resolveMember(action.memberQuery, knownMembers);
+        if (!member) {
           resolved.push(
             ambiguousReason(
               language,
@@ -802,8 +832,8 @@ function resolveActions(
           continue;
         }
         const createAction = createdByVirtualId.get(task.id);
-        if (createAction && !createAction.assignees.includes(member.name)) {
-          createAction.assignees.push(member.name);
+        if (createAction && !createAction.assignees.includes(member)) {
+          createAction.assignees.push(member);
         }
         continue;
       }
@@ -828,6 +858,20 @@ function resolveActions(
         checklist: [],
         completed: false,
       });
+    }
+  }
+
+  // Model fallback: sometimes it says "create X and assign Itamar" in speech
+  // but returns only createTask. Make that deterministic by extracting a known
+  // member from the original command whenever assignment intent is present.
+  if (/\b(assign|add|give)\b/i.test(command) || /תשבצי?|תוסיף|תוסיפי|שבץ/u.test(command)) {
+    const member = resolveMember(command, knownMembers);
+    if (member) {
+      for (const action of resolved) {
+        if (action.type === "createTask" && !action.assignMe && !action.assignees.includes(member)) {
+          action.assignees.push(member);
+        }
+      }
     }
   }
 
@@ -1043,7 +1087,7 @@ export async function POST(request: Request) {
     });
 
     const proposal = result.object;
-    const resolved = resolveActions(proposal.actions, latestState, language, me);
+    const resolved = resolveActions(proposal.actions, latestState, language, me, command);
 
     const hasAmbiguous = resolved.some((r) => r.type === "ambiguous");
     return NextResponse.json({
