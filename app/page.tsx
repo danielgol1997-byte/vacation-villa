@@ -195,6 +195,49 @@ export default function Home() {
   const [error, setError] = useState("");
   const [bootChecked, setBootChecked] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  // Track in-flight writes so background polling doesn't clobber an
+  // optimistic local update with stale server data.
+  const pendingWritesRef = useRef(0);
+
+  const loadState = useCallback(async () => {
+    try {
+      setError("");
+      const response = await fetch("/api/state", { cache: "no-store" });
+      const data = (await response.json()) as ApiResponse;
+      if (!response.ok) throw new Error("טעינה נכשלה");
+      setState(data.state);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "שגיאה");
+    }
+  }, []);
+
+  // Background refresh — keeps every device in sync. Skips while a local
+  // write is in flight (to avoid overwriting an optimistic update with the
+  // pre-write snapshot from the server) and stays silent on error so
+  // intermittent network blips don't show angry red banners.
+  const refreshState = useCallback(async () => {
+    if (pendingWritesRef.current > 0) return;
+    if (typeof document !== "undefined" && document.hidden) return;
+    try {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      if (!response.ok) return;
+      const data = (await response.json()) as ApiResponse;
+      if (pendingWritesRef.current > 0) return;
+      setState((prev) => {
+        if (!prev) return data.state;
+        // Only replace if the server has something newer. updatedAt is
+        // refreshed on every PUT so this is a reliable monotonic clock.
+        const prevAt = Date.parse(prev.updatedAt || "");
+        const nextAt = Date.parse(data.state.updatedAt || "");
+        if (Number.isFinite(prevAt) && Number.isFinite(nextAt) && nextAt <= prevAt) {
+          return prev;
+        }
+        return data.state;
+      });
+    } catch {
+      /* swallow: this is best-effort background polling */
+    }
+  }, []);
 
   useEffect(() => {
     // Intentionally NOT auto-restoring `me` from localStorage on boot —
@@ -206,37 +249,50 @@ export default function Home() {
     // never *read* it to bypass the picker.
     setBootChecked(true);
     void loadState();
-  }, []);
+  }, [loadState]);
 
-  async function loadState() {
-    try {
-      setError("");
-      const response = await fetch("/api/state", { cache: "no-store" });
-      const data = (await response.json()) as ApiResponse;
-      if (!response.ok) throw new Error("טעינה נכשלה");
-      setState(data.state);
-    } catch (caughtError) {
-      setError(caughtError instanceof Error ? caughtError.message : "שגיאה");
-    }
-  }
+  // Poll every 5 seconds + refresh whenever the tab regains focus or
+  // becomes visible again, so phones returning from background catch up
+  // immediately.
+  useEffect(() => {
+    const POLL_MS = 5000;
+    const interval = window.setInterval(() => void refreshState(), POLL_MS);
+    const onFocus = () => void refreshState();
+    const onVisibility = () => {
+      if (!document.hidden) void refreshState();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refreshState]);
 
-  const saveState = useCallback(async (nextState: VacationState) => {
-    setState(nextState);
-    try {
-      const response = await fetch("/api/state", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(nextState),
-      });
-      const data = (await response.json()) as ApiResponse;
-      if (!response.ok) throw new Error("השמירה נכשלה");
-      setState(data.state);
-      setError("");
-    } catch (caughtError) {
-      setError(caughtError instanceof Error ? caughtError.message : "שגיאה");
-      void loadState();
-    }
-  }, []);
+  const saveState = useCallback(
+    async (nextState: VacationState) => {
+      setState(nextState);
+      pendingWritesRef.current += 1;
+      try {
+        const response = await fetch("/api/state", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(nextState),
+        });
+        const data = (await response.json()) as ApiResponse;
+        if (!response.ok) throw new Error("השמירה נכשלה");
+        setState(data.state);
+        setError("");
+      } catch (caughtError) {
+        setError(caughtError instanceof Error ? caughtError.message : "שגיאה");
+        void loadState();
+      } finally {
+        pendingWritesRef.current -= 1;
+      }
+    },
+    [loadState],
+  );
 
   const handleLogin = useCallback(
     (name: string, ensureMember = true) => {

@@ -1,4 +1,4 @@
-import { list, put } from "@vercel/blob";
+import { head, put } from "@vercel/blob";
 import { NextResponse } from "next/server";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -121,14 +121,28 @@ function normalizeState(raw: Partial<VacationState>): VacationState {
 }
 
 async function readBlobState() {
-  const { blobs } = await list({ prefix: DATA_PATH, limit: 1 });
-  const blob = blobs.find((item) => item.pathname === DATA_PATH);
-
-  if (!blob) {
-    return seedState;
+  // We deliberately do NOT use `list()` here because `list()` is eventually
+  // consistent on Vercel Blob — for a few seconds after a write, list can
+  // still return the previous URL, which means a sibling device polling
+  // immediately after a teammate's update would see stale data.
+  //
+  // Since we always write the same pathname with addRandomSuffix: false +
+  // cacheControlMaxAge: 0, the URL is stable and the CDN won't serve stale
+  // bytes. `head()` returns metadata for that exact pathname (strongly
+  // consistent against the latest write).
+  let blobUrl: string | null = null;
+  try {
+    const meta = await head(DATA_PATH);
+    blobUrl = meta.url;
+  } catch (err) {
+    // 404 = blob doesn't exist yet (first read after store creation).
+    if ((err as { status?: number })?.status === 404) {
+      return seedState;
+    }
+    throw err;
   }
 
-  const response = await fetch(blob.url, { cache: "no-store" });
+  const response = await fetch(blobUrl, { cache: "no-store" });
   if (!response.ok) {
     throw new Error("Failed to read vacation state");
   }
@@ -141,6 +155,12 @@ async function writeBlobState(state: VacationState) {
   await put(DATA_PATH, JSON.stringify(state, null, 2), {
     access: "public",
     allowOverwrite: true,
+    // Stable URL: every write replaces the same blob, so readers always
+    // hit the most-recent content and there's no propagation race.
+    addRandomSuffix: false,
+    // Zero CDN TTL: the blob URL is the same forever but its body changes
+    // on every write. We can't let the CDN cache it.
+    cacheControlMaxAge: 0,
     contentType: "application/json",
   });
 }
