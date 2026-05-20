@@ -132,6 +132,10 @@ type ResolvedAction =
       type: "setLanguage";
       language: AssistantLanguage;
     }
+  | {
+      type: "answer";
+      text: string;
+    }
   | { type: "ambiguous"; reason: string };
 
 type Proposal = {
@@ -235,6 +239,7 @@ const NO_PATTERNS_EN = [
 const SILENCE_TIMEOUT_MS = 2800;
 const LISTENING_MAX_MS = 14000;
 const CONFIRM_MAX_MS = 18000;
+const RECOGNITION_WATCHDOG_MS = 1200;
 
 const PROMPTS = {
   he: {
@@ -423,6 +428,19 @@ function speak(text: string, lang: string): Promise<void> {
     try {
       window.speechSynthesis.cancel();
       const utt = new SpeechSynthesisUtterance(text);
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        resolve();
+      };
+      // iOS/Safari sometimes never fires onend/onerror after cancel/speak
+      // races. Never let TTS hold the whole assistant in "speaking".
+      const timeout = window.setTimeout(
+        finish,
+        Math.min(8000, Math.max(1800, text.length * 90)),
+      );
       utt.lang = lang;
       const langKey: "he" | "en" = lang.toLowerCase().startsWith("en")
         ? "en"
@@ -434,8 +452,8 @@ function speak(text: string, lang: string): Promise<void> {
       utt.rate = 0.98;
       utt.pitch = 1.0;
       utt.volume = 1.0;
-      utt.onend = () => resolve();
-      utt.onerror = () => resolve();
+      utt.onend = finish;
+      utt.onerror = finish;
       window.speechSynthesis.speak(utt);
     } catch {
       resolve();
@@ -595,6 +613,8 @@ function summarizeAction(
         return action.language === "en"
           ? "Switch assistant to English"
           : "Switch assistant to Hebrew";
+      case "answer":
+        return action.text;
       case "ambiguous":
         return action.reason;
     }
@@ -646,6 +666,8 @@ function summarizeAction(
       return action.language === "en"
         ? "להחליף את העוזרת לאנגלית"
         : "להחליף את העוזרת לעברית";
+    case "answer":
+      return action.text;
     case "ambiguous":
       return action.reason;
   }
@@ -841,6 +863,8 @@ function applyActions(
         };
         break;
       }
+      case "answer":
+        break;
       case "ambiguous":
         break;
     }
@@ -1067,6 +1091,21 @@ export function useVoiceAssistant({
           return;
         }
 
+        const readOnlyAnswer =
+          data.resolved.length === 1 && data.resolved[0]?.type === "answer"
+            ? data.resolved[0]
+            : null;
+        if (readOnlyAnswer?.type === "answer") {
+          const answer = readOnlyAnswer.text.trim() || data.proposal.speech;
+          setProposal(null);
+          pendingProposalRef.current = null;
+          setStatusSafe("speaking");
+          await speak(answer, bcp47);
+          setTranscript(answer);
+          setStatusSafe(activeRef.current ? "idle" : "off");
+          return;
+        }
+
         pendingProposalRef.current = {
           resolved: data.resolved,
           speech: data.proposal.speech,
@@ -1206,6 +1245,19 @@ export function useVoiceAssistant({
     }, SILENCE_TIMEOUT_MS);
   }, [clearTimers, drainPendingText, handleFinalCommand, setStatusSafe, stopRecognition]);
 
+  const armListeningMaxTimer = useCallback(() => {
+    if (listeningTimerRef.current !== null) {
+      window.clearTimeout(listeningTimerRef.current);
+    }
+    listeningTimerRef.current = window.setTimeout(() => {
+      const text = drainPendingText();
+      stopRecognition();
+      clearTimers();
+      if (text) handleFinalCommand(text);
+      else setStatusSafe(activeRef.current ? "idle" : "off");
+    }, LISTENING_MAX_MS);
+  }, [clearTimers, drainPendingText, handleFinalCommand, setStatusSafe, stopRecognition]);
+
   /* -------------------- Recognition setup -------------------- */
 
   // Called when the wake word is detected. Acknowledges the user audibly,
@@ -1248,13 +1300,9 @@ export function useVoiceAssistant({
 
       // Safety net: if the user never says anything, return to idle. We
       // still drain the buffers in case partial speech was captured.
-      listeningTimerRef.current = window.setTimeout(() => {
-        const text = drainPendingText();
-        if (text) handleFinalCommand(text);
-        else setStatusSafe(activeRef.current ? "idle" : "off");
-      }, LISTENING_MAX_MS);
+      armListeningMaxTimer();
     },
-    [clearTimers, drainPendingText, handleFinalCommand, setStatusSafe],
+    [armListeningMaxTimer, clearTimers, handleFinalCommand, setStatusSafe],
   );
 
   const startBackgroundRecognition = useCallback(() => {
@@ -1367,6 +1415,15 @@ export function useVoiceAssistant({
         provisionalRef.current = "";
       }
 
+      // Mobile browsers often end SpeechRecognition after one utterance
+      // without another result event after the user pauses. If we already
+      // have buffered text when that happens, arm the normal silence
+      // commit timer now so the command cannot sit on screen forever as
+      // "listening".
+      if (statusRef.current === "listening" && interimRef.current.trim()) {
+        armSilenceTimer();
+      }
+
       // Chrome's continuous mode is notoriously flaky — it ends sessions
       // randomly even when continuous=true. We ALWAYS restart in any
       // active listening-capable state, and never commit partial text
@@ -1403,7 +1460,6 @@ export function useVoiceAssistant({
   }, [
     applyProposal,
     armSilenceTimer,
-    clearTimers,
     handleFinalCommand,
     handleWake,
     rejectProposal,
@@ -1448,6 +1504,26 @@ export function useVoiceAssistant({
     startBackgroundRecognition();
   }, [active, language, setStatusSafe, startBackgroundRecognition, stopRecognition]);
 
+  // Foolproof re-arm watchdog. SpeechRecognition is fragile on mobile:
+  // it can end without firing an error, or `start()` can be ignored after
+  // TTS/permission transitions. This lightweight heartbeat guarantees
+  // that any active listening-capable state always has a live recognizer
+  // again shortly after it disappears.
+  useEffect(() => {
+    if (!active || !ctorRef.current) return;
+    const id = window.setInterval(() => {
+      if (!activeRef.current || recognitionRef.current) return;
+      if (
+        statusRef.current === "idle" ||
+        statusRef.current === "listening" ||
+        statusRef.current === "confirming"
+      ) {
+        startBgRecRef.current();
+      }
+    }, RECOGNITION_WATCHDOG_MS);
+    return () => window.clearInterval(id);
+  }, [active]);
+
   /* -------------------- Public API -------------------- */
 
   const triggerListen = useCallback(() => {
@@ -1465,20 +1541,11 @@ export function useVoiceAssistant({
     setTranscript("");
     setStatusSafe("listening");
     chime("wake");
-    listeningTimerRef.current = window.setTimeout(() => {
-      const text = drainPendingText();
-      stopRecognition();
-      clearTimers();
-      if (text) handleFinalCommand(text);
-      else setStatusSafe(activeRef.current ? "idle" : "off");
-    }, LISTENING_MAX_MS);
+    armListeningMaxTimer();
   }, [
-    clearTimers,
-    drainPendingText,
-    handleFinalCommand,
+    armListeningMaxTimer,
     setStatusSafe,
     startBackgroundRecognition,
-    stopRecognition,
   ]);
 
   const cancel = useCallback(() => {

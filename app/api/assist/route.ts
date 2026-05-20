@@ -45,6 +45,9 @@ const ACTION_TYPES = [
   "setTaskNeeded",
   // Assistant-level settings (mirrors the orb's HE/EN toggle).
   "setLanguage",
+  // Read-only answers. These NEVER require confirmation and must not mutate
+  // state — the client just speaks the answer and returns to wake-word mode.
+  "answer",
 ] as const;
 
 // Flat action shape — required by OpenAI structured outputs (no `oneOf`).
@@ -131,6 +134,11 @@ const FlatActionSchema = z.object({
     .enum(["he", "en", ""] as const)
     .describe(
       'Language code for setLanguage ("he" for Hebrew, "en" for English). Use "" for other action types.',
+    ),
+  answer: z
+    .string()
+    .describe(
+      'A concise answer for read-only information requests (answer only). Use "" otherwise. Must be in the user\'s preferred spoken language.',
     ),
 });
 
@@ -260,6 +268,10 @@ export type ResolvedAction =
   | {
       type: "setLanguage";
       language: AssistantLanguage;
+    }
+  | {
+      type: "answer";
+      text: string;
     }
   | { type: "ambiguous"; reason: string };
 
@@ -706,6 +718,17 @@ function resolveAction(
         );
       return { type: "setLanguage", language: lang };
     }
+    case "answer": {
+      const text = action.answer.trim();
+      if (!text) {
+        return ambiguousReason(
+          language,
+          "לא מצאתי תשובה ברורה. מה תרצי לדעת?",
+          "I could not find a clear answer. What would you like to know?",
+        );
+      }
+      return { type: "answer", text };
+    }
   }
 }
 
@@ -722,6 +745,8 @@ The current user is "${me || "unknown"}" and their preferred spoken language is 
 
 # YOUR JOB
 Translate a single spoken request into a list of structured actions on the app state. You only PROPOSE — the client confirms and applies.
+
+Exception: if the user asks a read-only information question ("what am I signed up for?", "who is doing BBQ?", "what is still open?", "what is planned for Friday?"), return exactly one action of type:"answer". That answer is spoken immediately and must NOT ask for confirmation.
 
 # THE GOLDEN RULE: DATA STAYS HEBREW
 Every value you write into a data field — \`taskQuery\`, \`title\`, \`items\`, \`notes\`, \`itemQuery\`, \`planQuery\`, \`location\`, \`newTitle\` — MUST be in natural Hebrew. \`memberQuery\` may stay in the user's language (the server fuzzy-matches it against the members list).
@@ -741,8 +766,10 @@ The \`speech\` field is what the assistant SAYS BACK aloud. It MUST be in ${spok
 - User speaks English → speech in English.
 - The data underneath is still Hebrew; speech describes the action in the user's language.
 
-# THIRD RULE: SPEECH IS SHORT AND ENDS IN A CONFIRMATION QUESTION
+# THIRD RULE: SPEECH IS SHORT; MUTATIONS END IN A CONFIRMATION QUESTION
 \`speech\` is what gets read aloud. Keep it under 12 words. State the GENERAL IDEA only — never list each individual action. End with a short confirm prompt like "נכון?" / "OK?" / "confirm?". The user already SEES the detailed actions on screen; the voice just needs the gist.
+
+For type:"answer" only, \`speech\` should be the same as \`answer\`, must answer the question directly, and must NOT include "confirm?", "OK?", "נכון?", or any confirmation wording.
 
 Good speech examples:
 - (he) "להוסיף אותך לקייטרינג ולקנייה בסופר, נכון?"
@@ -775,6 +802,7 @@ Per-type field guide (all unlisted fields must use their default):
 - type:"editTaskTitle"        → taskQuery, newTitle (the new Hebrew title)
 - type:"setTaskNeeded"        → taskQuery, needed (>=1)
 - type:"setLanguage"          → targetLanguage ("he" or "en") — for "switch to English", "תעבירי לעברית"
+- type:"answer"               → answer (read-only info question only; no confirmation)
 
 # MATCHING TASKS BY VOICE
 - Don't invent tasks. The taskQuery must point at an existing Hebrew title (server fuzzy-matches it).
@@ -810,6 +838,22 @@ Map English day names: Thursday → "חמישי", Friday → "שישי", Saturda
 - "Replace the notes with X", "Change the notes to X", "Clear the notes" → setNotes (notes="" to clear).
 - "Add a note saying X" → appendNotes (does NOT overwrite existing notes).
 - "Switch to English", "Speak English", "תעבירי לאנגלית", "תדברי עברית" → setLanguage with targetLanguage="en" or "he" as appropriate.
+- "What am I signed up for?", "מה שלי?", "What still needs volunteers?", "Who is doing BBQ?", "What's planned for Friday?" → answer. Use the provided task/plan context; do NOT create actions and do NOT require confirmation.
+
+# READ-ONLY ANSWERS
+Use type:"answer" for questions that only ask for information:
+- What tasks am I signed up for / what is mine?
+- Who is assigned to a specific task?
+- Which tasks still need people?
+- What is on the plan for a given day?
+- Is a specific task full / done / open?
+
+For answer:
+- actions must contain exactly one object with type:"answer"
+- answer must be concise and in ${spokenLanguageName}
+- speech should equal the answer or be an even shorter version
+- needsClarification must be false unless the question is too vague to answer
+- NEVER end an answer with a confirmation question
 
 # WHEN TO ASK FOR CLARIFICATION (needsClarification: true)
 - Request doesn't match any known action type.
@@ -819,7 +863,7 @@ In those cases set actions: [] and use speech to ask a short specific question i
 
 # CONSTANTS
 - Max 3 actions per request — keep focused.
-- Speech under 12 words, general idea only, ends with confirm question.
+- Speech under 12 words for mutation proposals; read-only answers may be up to 30 words and must not ask for confirmation.
 - ${spokenLanguageName} for speech is non-negotiable.
 - Hebrew for every data field that lands on a card is non-negotiable.`;
 }
