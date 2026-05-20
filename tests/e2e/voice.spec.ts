@@ -130,10 +130,6 @@ async function latestRecognitionSpeak(
 async function wake(page: Page) {
   await latestRecognitionSpeak(page, "hey villa");
   await expect(page.getByText("Speak now…")).toBeVisible();
-  // setStatusSafe starts a fresh recognizer on a short timeout after the
-  // "Yes?" TTS finishes. Give that recognizer a beat to become the latest
-  // instance before sending the actual command.
-  await page.waitForTimeout(500);
 }
 
 async function confirmByVoice(page: Page) {
@@ -194,7 +190,7 @@ function mockAssist(page: Page, mocks: AssistMock[]) {
 }
 
 test.describe("voice assistant state machine", () => {
-  test("mobile interim speech + recognizer end commits the command and applies a created task", async ({
+  test("wake word immediately accepts speech and applies a created task", async ({
     page,
     baseURL,
   }) => {
@@ -218,7 +214,10 @@ test.describe("voice assistant state machine", () => {
       },
     ]);
 
-    await wake(page);
+    await latestRecognitionSpeak(page, "hey villa");
+    // This is the important mobile regression: users start speaking right
+    // after the wake word. The assistant must already be in `listening`
+    // without waiting for a spoken "Yes?" acknowledgement.
     await latestRecognitionSpeak(page, "create a task bring towels", {
       final: false,
       end: true,

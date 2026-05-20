@@ -1413,19 +1413,13 @@ export function useVoiceAssistant({
 
   /* -------------------- Recognition setup -------------------- */
 
-  // Called when the wake word is detected. Acknowledges the user audibly,
-  // then either submits the rest of the utterance immediately (same-breath
-  // command) or transitions into command-listening with a freshly-started
-  // recognition session.
-  //
-  // We transition through "speaking" while the "Yes?" prompt plays so that
-  // `setStatusSafe` keeps the mic muted — otherwise the TTS would echo
-  // back as a phantom command.
+  // Called when the wake word is detected. It must enter listening
+  // immediately: on mobile, a spoken "Yes?" introduces a multi-second gap
+  // while TTS initializes, and users naturally begin speaking during that
+  // gap. The wake chime + visible transcript panel are the acknowledgment;
+  // the microphone stays ready for the actual command.
   const handleWake = useCallback(
     async (rest: string) => {
-      const lang = languageRef.current;
-      const cfg = langConfig(lang);
-
       clearTimers();
       interimRef.current = "";
       provisionalRef.current = "";
@@ -1439,16 +1433,6 @@ export function useVoiceAssistant({
         return;
       }
 
-      // Mute the mic via the "speaking" state, then play the prompt.
-      setStatusSafe("speaking");
-      await speak(cfg.prompts.prompt, cfg.bcp47);
-
-      // The user (or another flow — cancel button, etc.) may have changed
-      // state while we were speaking. Only proceed if we're still in the
-      // "speaking" state we set above.
-      if (statusRef.current !== "speaking") return;
-
-      // Enter listening; setStatusSafe will start a fresh recognition.
       setStatusSafe("listening");
 
       // Safety net: if the user never says anything, return to idle. We
