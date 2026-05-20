@@ -296,6 +296,97 @@ test.describe("voice assistant state machine", () => {
       .toEqual({ day: "שישי", assignees: ["הדסה", "מיכל"] });
   });
 
+  test("can create a task and assign someone in one confirmation", async ({
+    page,
+    baseURL,
+  }) => {
+    await setupVoicePage(page, baseURL!);
+    mockAssist(page, [
+      {
+        match: /create.*chairs.*itamar/i,
+        response: {
+          speech: "Create chairs and assign Itamar, OK?",
+          resolved: [
+            {
+              type: "createTask",
+              title: "להביא כיסאות",
+              day: "לפני",
+              needed: 1,
+              notes: "",
+              assignMe: false,
+              assignees: ["איתמר"],
+            },
+          ],
+        },
+      },
+    ]);
+
+    await wake(page);
+    await latestRecognitionSpeak(page, "create a chairs task and assign itamar");
+    await confirmByVoice(page);
+
+    await expect
+      .poll(async () => {
+        const state = await (await page.request.get(`${baseURL}/api/state`)).json();
+        const task = state.state.tasks.find(
+          (item: { title: string }) => item.title === "להביא כיסאות",
+        );
+        return task ? { assignees: task.assignees, needed: task.needed } : null;
+      })
+      .toEqual({ assignees: ["איתמר"], needed: 1 });
+  });
+
+  test("handles repeated voice confirmations without alternating drops", async ({
+    page,
+    baseURL,
+  }) => {
+    await setupVoicePage(page, baseURL!);
+    mockAssist(page, [
+      {
+        match: /first towels/i,
+        response: {
+          speech: "Create first task, OK?",
+          resolved: [
+            {
+              type: "createTask",
+              title: "משימה ראשונה",
+              day: "לפני",
+              needed: 1,
+              notes: "",
+              assignMe: false,
+            },
+          ],
+        },
+      },
+      {
+        match: /second towels/i,
+        response: {
+          speech: "Create second task, OK?",
+          resolved: [
+            {
+              type: "createTask",
+              title: "משימה שניה",
+              day: "לפני",
+              needed: 1,
+              notes: "",
+              assignMe: false,
+            },
+          ],
+        },
+      },
+    ]);
+
+    await wake(page);
+    await latestRecognitionSpeak(page, "first towels");
+    await confirmByVoice(page);
+    await expect(page.getByRole("heading", { name: "משימה ראשונה" })).toBeVisible();
+
+    await wake(page);
+    await latestRecognitionSpeak(page, "second towels");
+    await confirmByVoice(page);
+    await expect(page.getByRole("heading", { name: "משימה שניה" })).toBeVisible();
+  });
+
   test("can switch an assignment from one person to another by voice", async ({
     page,
     baseURL,

@@ -158,7 +158,7 @@ const ProposalSchema = z.object({
   actions: z
     .array(FlatActionSchema)
     .describe(
-      "List of actions to propose (max 3). Empty when needsClarification is true.",
+      "List of actions to propose (max 5). Empty when needsClarification is true.",
     ),
 });
 
@@ -179,6 +179,7 @@ export type ResolvedAction =
       needed: number;
       notes: string;
       assignMe: boolean;
+      assignees: string[];
     }
   | { type: "deleteTask"; taskId: string; taskTitle: string }
   | {
@@ -432,6 +433,7 @@ function resolveAction(
         needed,
         notes: action.notes,
         assignMe: action.assignMe,
+        assignees: [],
       };
     }
     case "deleteTask": {
@@ -767,6 +769,71 @@ function resolveAction(
   }
 }
 
+function resolveActions(
+  actions: AssistAction[],
+  state: VacationState,
+  language: AssistantLanguage,
+  me: string,
+): ResolvedAction[] {
+  const resolved: ResolvedAction[] = [];
+  const virtualTasks: VacationTask[] = [...state.tasks];
+  const createdByVirtualId = new Map<string, Extract<ResolvedAction, { type: "createTask" }>>();
+  const knownMembers = knownMembersOf(state, me);
+
+  for (const action of actions) {
+    if (action.type === "addAssignee" && action.taskQuery) {
+      const task = resolveTask(action.taskQuery, virtualTasks);
+      if (task?.id.startsWith("__created:")) {
+        if (!action.memberQuery) {
+          resolved.push(
+            ambiguousReason(language, "חסר שם של חבר משפחה.", "Missing a family member name."),
+          );
+          continue;
+        }
+        const member = findClosestMember(action.memberQuery, knownMembers);
+        if (!member || member.score < 0.55) {
+          resolved.push(
+            ambiguousReason(
+              language,
+              `לא מצאתי בן משפחה שמתאים ל-"${action.memberQuery}".`,
+              `I couldn't find a family member matching "${action.memberQuery}".`,
+            ),
+          );
+          continue;
+        }
+        const createAction = createdByVirtualId.get(task.id);
+        if (createAction && !createAction.assignees.includes(member.name)) {
+          createAction.assignees.push(member.name);
+        }
+        continue;
+      }
+    }
+
+    const next = resolveAction(action, { ...state, tasks: virtualTasks }, language, me);
+    resolved.push(next);
+
+    if (next.type === "createTask") {
+      const virtualId = `__created:${resolved.length}`;
+      createdByVirtualId.set(virtualId, next);
+      virtualTasks.unshift({
+        id: virtualId,
+        title: next.title,
+        needed: Math.max(next.needed, next.assignees.length || (next.assignMe ? 1 : 0), 1),
+        assignees: [
+          ...(next.assignMe ? [me] : []),
+          ...next.assignees,
+        ].filter(Boolean),
+        day: next.day,
+        notes: next.notes,
+        checklist: [],
+        completed: false,
+      });
+    }
+  }
+
+  return resolved;
+}
+
 /* ------------------------------------------------------------------ */
 /* SYSTEM PROMPT                                                      */
 /* ------------------------------------------------------------------ */
@@ -856,6 +923,7 @@ Map English day names: Thursday → "חמישי", Friday → "שישי", Saturda
 - "Sign me up", "add me", "I'll do it", "תרשמי אותי", "אני אקח" → signup.
 - "Take me off", "unsign me", "תורידי אותי", "תבטלי" → unsignup.
 - "Add a task", "create task", "תוסיפי משימה" → createTask.
+- "Create a task/card X and assign Hadassah to it" → two actions in this order: createTask for X, then addAssignee with taskQuery equal to X and memberQuery="Hadassah"/"הדסה". The server will merge them into one created card with the assignee.
 - "Delete task", "remove task", "תמחקי" → deleteTask.
 - "Mark done", "completed", "סיימתי" → markCompleted with done:true.
 - "Reopen", "not done" → markCompleted with done:false.
@@ -898,7 +966,7 @@ For answer:
 In those cases set actions: [] and use speech to ask a short specific question in ${spokenLanguageName}.
 
 # CONSTANTS
-- Max 3 actions per request — keep focused.
+- Max 5 actions per request — enough for "create a card and assign people", but keep focused.
 - Speech under 12 words for mutation proposals; read-only answers may be up to 30 words and must not ask for confirmation.
 - ${spokenLanguageName} for speech is non-negotiable.
 - Hebrew for every data field that lands on a card is non-negotiable.`;
@@ -975,9 +1043,7 @@ export async function POST(request: Request) {
     });
 
     const proposal = result.object;
-    const resolved = proposal.actions.map((action) =>
-      resolveAction(action, latestState, language, me),
-    );
+    const resolved = resolveActions(proposal.actions, latestState, language, me);
 
     const hasAmbiguous = resolved.some((r) => r.type === "ambiguous");
     return NextResponse.json({

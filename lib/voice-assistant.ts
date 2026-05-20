@@ -42,6 +42,7 @@ type ResolvedAction =
       needed: number;
       notes: string;
       assignMe: boolean;
+      assignees?: string[];
     }
   | { type: "deleteTask"; taskId: string; taskTitle: string }
   | {
@@ -727,7 +728,7 @@ function summarizeAction(
       case "createTask":
         return `Create task "${action.title}" on ${action.day}${
           action.needed > 1 ? `, ${action.needed} people` : ""
-        }`;
+        }${action.assignees?.length ? `, assign ${action.assignees.join(", ")}` : ""}`;
       case "deleteTask":
         return `Delete task "${action.taskTitle}"`;
       case "markCompleted":
@@ -780,7 +781,7 @@ function summarizeAction(
     case "createTask":
       return `להוסיף משימה חדשה "${action.title}" ביום ${action.day}${
         action.needed > 1 ? `, ${action.needed} אנשים` : ""
-      }`;
+      }${action.assignees?.length ? `, לשבץ את ${action.assignees.join(", ")}` : ""}`;
     case "deleteTask":
       return `למחוק את המשימה "${action.taskTitle}"`;
     case "markCompleted":
@@ -878,13 +879,22 @@ function applyActions(
         );
         break;
       case "createTask": {
+        const explicitAssignees = action.assignees ?? [];
+        for (const assignee of explicitAssignees) ensureMember(assignee);
+        if (action.assignMe) ensureMember(me);
+        const assignees = Array.from(
+          new Set([
+            ...(action.assignMe ? [me] : []),
+            ...explicitAssignees,
+          ].filter(Boolean)),
+        );
         const newTask: VacationTask = {
           id: generateChecklistId("task"),
           title: action.title,
-          needed: action.needed,
+          needed: Math.max(action.needed, assignees.length || 1),
           day: action.day,
           notes: action.notes,
-          assignees: action.assignMe ? [me] : [],
+          assignees,
           checklist: [],
           completed: false,
         };
@@ -1085,6 +1095,7 @@ export function useVoiceAssistant({
   } | null>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const recognitionRequestRef = useRef(0);
 
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -1178,6 +1189,7 @@ export function useVoiceAssistant({
   }, []);
 
   const stopRecognition = useCallback(() => {
+    recognitionRequestRef.current += 1;
     const rec = recognitionRef.current;
     if (!rec) return;
     try {
@@ -1449,6 +1461,7 @@ export function useVoiceAssistant({
 
   const startBackgroundRecognition = useCallback((allowPermissionPrompt = false) => {
     void (async () => {
+      const requestId = ++recognitionRequestRef.current;
       const Ctor = ctorRef.current;
       if (!Ctor || !activeRef.current) return;
 
@@ -1457,6 +1470,7 @@ export function useVoiceAssistant({
       // user has explicitly denied access, while still letting a prior grant
       // start silently on future visits/devices that support persistent grants.
       const permission = await getMicrophonePermissionState();
+      if (requestId !== recognitionRequestRef.current) return;
       if (permission === "denied") {
         clearRememberedMicPermission();
         setErrorMessage(langConfig(languageRef.current).prompts.permissionDenied);
@@ -1473,7 +1487,29 @@ export function useVoiceAssistant({
         return;
       }
 
-      stopRecognition();
+      const existing = recognitionRef.current;
+      if (existing) {
+        try {
+          existing.onresult = null;
+          existing.onerror = null;
+          existing.onend = null;
+          existing.stop();
+        } catch {
+          // ignore
+        }
+        recognitionRef.current = null;
+      }
+      if (
+        requestId !== recognitionRequestRef.current ||
+        !activeRef.current ||
+        !(
+          statusRef.current === "idle" ||
+          statusRef.current === "listening" ||
+          statusRef.current === "confirming"
+        )
+      ) {
+        return;
+      }
       const lang = languageRef.current;
       const cfg = langConfig(lang);
       const rec = new Ctor();
@@ -1574,6 +1610,7 @@ export function useVoiceAssistant({
     };
 
     rec.onend = () => {
+      if (recognitionRef.current !== rec) return;
       recognitionRef.current = null;
 
       // If we were mid-listening and have a live interim guess, promote
@@ -1624,7 +1661,17 @@ export function useVoiceAssistant({
 
     try {
       rec.start();
-      recognitionRef.current = rec;
+      if (
+        requestId === recognitionRequestRef.current &&
+        activeRef.current &&
+        (statusRef.current === "idle" ||
+          statusRef.current === "listening" ||
+          statusRef.current === "confirming")
+      ) {
+        recognitionRef.current = rec;
+      } else {
+        rec.abort();
+      }
     } catch {
       // Already started; ignore.
     }
